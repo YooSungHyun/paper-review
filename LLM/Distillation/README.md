@@ -44,7 +44,7 @@ https://arxiv.org/abs/2306.13649
 
 ![2](./img/2.png)
 
-1/2는 일단 상수값이니까 그냥 없는셈 치고, 베타에 0이나 1을 넣어보면, P의 입장에서 바라보거나(Forward), Q의 입장에서 바라보게되므로(Forward) JSD의 그라디언트는, `behave similary`하게 된다고 표현하였다. (이걸 이해하려면, Taylor expansion or first-order 근사를 이해해야함)
+베타에 아주 작은값 이나 거의 1과 같은값을 넣어보면, P의 입장에서 바라보거나(Forward), Q의 입장에서 바라보게되므로(Reverse) JSD의 그라디언트는, `behave similary`하게 된다고 표현하였다. (이걸 이해하려면, Taylor expansion or first-order 근사를 이해해야함)
 
 일단은 나도 Reverse-KLD+Student CE 혹은 KLD+Student CE를 했었을때, 잘 안됐는데, 위에 내용대로면 뭔가 KLD나 ReverseKLD로도 충분히 수렴시킬 수 있다는 얘기처럼 들리는데, 이후의 내용을 더 살펴보도록 하자. (내가 잘못한게 아니겠지?)
 
