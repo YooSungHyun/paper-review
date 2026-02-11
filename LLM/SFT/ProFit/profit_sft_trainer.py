@@ -249,7 +249,7 @@ class ProFitSFTTrainer(SFTTrainer):
         Args:
             source: logits [N, vocab_size]
             target: labels [N]
-            num_items_in_batch: 전체 배치 아이템 수
+            num_items_in_batch: 전체 배치 아이템 수 (사용 안 함, 호환성 유지용)
             prob_threshold: 확률 임계값
             threshold_direction: 마스킹 방향
             ignore_index: 무시할 인덱스 값
@@ -291,17 +291,17 @@ class ProFitSFTTrainer(SFTTrainer):
         # 5. 마스킹 적용
         new_target[mask_condition] = ignore_index
         
-        # 6. Loss 계산
-        reduction = "sum" if num_items_in_batch is not None else "mean"
+        # 6. 유효한 토큰 개수 계산 (원래 마스킹 + ProFit 마스킹 모두 고려)
+        # transformers의 LabelSmoother와 동일한 방식
+        num_active_elements = (new_target != ignore_index).sum()
+        
+        # 7. Loss 계산 (reduction="sum"으로 먼저 합산)
         loss = F.cross_entropy(
-            source, new_target, ignore_index=ignore_index, reduction=reduction
+            source, new_target, ignore_index=ignore_index, reduction="sum"
         )
         
-        # 7. Gradient accumulation을 고려한 정규화
-        if reduction == "sum":
-            if torch.is_tensor(num_items_in_batch):
-                num_items_in_batch = num_items_in_batch.to(loss.device)
-            loss = loss / num_items_in_batch
+        # 8. 토큰 단위 평균 계산 (유효한 토큰 개수로 나누기)
+        loss = loss / torch.clamp(num_active_elements, min=1)
         
         return loss
 
