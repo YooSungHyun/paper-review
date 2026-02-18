@@ -1,16 +1,22 @@
 """
-ProFit SFT Trainer - TRL 기반 구현
+ProFit SFT Trainer (patched) - TRL 기반 구현
 
 논문: ProFit: Leveraging High-Value Signals in SFT via Probability-Guided Token Selection
-GitHub: https://github.com/Utaotao/ProFit
 
-핵심 아이디어:
-- 높은 확률 토큰 = 핵심 논리/의미
-- 낮은 확률 토큰 = 대체 가능한 표현
-- 낮은 확률 토큰을 선택적으로 마스킹하여 표면적 과적합 방지
+이 버전의 목표:
+1) ProFit의 확률 기반 hard masking 게이트는 stop-gradient(detach)로 계산
+2) 마스킹 이후 active token만 학습
+3) 분산 학습에서 loss_sum / active_count를 all-reduce(sum)하여
+   "전역 token-weighted 평균 loss"를 반환 (길이/마스킹 비율/packing 차이에도 안정)
+
+(4) 실전 개선점 반영:
+- compute_loss에서 inputs dict in-place 수정 방지
+- prob_threshold에 가변 기본값(list) 미사용 (float 기본값 유지)
+- 마스킹 비율/active token 수를 주기적으로 로깅(기본 100 step)
 """
 
-import warnings
+from __future__ import annotations
+
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -23,49 +29,49 @@ from trl import SFTTrainer
 from trl.trainer.sft_config import SFTConfig
 
 
+def _dist_is_initialized() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _all_reduce_sum_(x: torch.Tensor) -> torch.Tensor:
+    """
+    분산 환경이면 x를 all-reduce(sum)해서 반환.
+
+    핵심 설계:
+    1. Forward: all_reduce로 global sum 계산 (detached 사용)
+    2. Backward: 원본 x를 통해 gradient 흐름 유지
+    3. DDP/DeepSpeed가 자동으로 gradient all_reduce 수행
+
+    트릭: detached_global_sum + (x - x.detach())
+    - Forward 값: detached_global_sum + 0 = global_sum
+    - Backward: (x - x.detach())를 통해 gradient는 x로만 흐름
+    """
+    if _dist_is_initialized():
+        # 1. 값만 all_reduce (gradient 끊음)
+        x_global = x.detach().clone()
+        torch.distributed.all_reduce(x_global, op=torch.distributed.ReduceOp.SUM)
+
+        # 2. Gradient graph 유지
+        # Forward: x_global + (x - x.detach()) = x_global + 0 = x_global
+        # Backward: gradient는 (x - x.detach())의 x를 통해서만 흐름
+        return x_global + (x - x.detach())
+    return x
+
+
 class ProFitSFTTrainer(SFTTrainer):
     """
     ProFit 알고리즘을 구현한 SFT Trainer.
-    
-    TRL의 SFTTrainer를 상속받아 compute_loss 메서드를 오버라이드하여
-    확률 기반 토큰 선택을 통한 selective masking을 구현합니다.
-    
-    Args:
-        prob_threshold (float or list[float]):
-            토큰 마스킹을 위한 확률 임계값.
-            - threshold_direction="higher"일 때: 이 값보다 낮은 확률의 토큰 마스킹
-            - threshold_direction="lower"일 때: 이 값보다 높은 확률의 토큰 마스킹
-            - threshold_direction="middle"일 때: [lower, upper] 범위 밖의 토큰 마스킹
-        threshold_direction (str):
-            마스킹 방향. "higher", "lower", "middle", "random" 중 선택.
-            - "higher": 낮은 확률 토큰 마스킹 (논문의 기본 설정)
-            - "lower": 높은 확률 토큰 마스킹
-            - "middle": 중간 범위 토큰만 학습
-            - "random": 랜덤 마스킹 (baseline)
-        use_profit_loss (bool):
-            ProFit loss 사용 여부. False일 경우 일반 SFT와 동일.
-    
-    Examples:
-        >>> from profit_sft_trainer import ProFitSFTTrainer
-        >>> from trl import SFTConfig
-        >>> 
-        >>> # ProFit 설정: 확률 0.3 미만의 토큰 마스킹
-        >>> config = SFTConfig(
-        ...     output_dir="./output",
-        ...     learning_rate=2e-5,
-        ...     num_train_epochs=3,
-        ... )
-        >>> 
-        >>> trainer = ProFitSFTTrainer(
-        ...     model="Qwen/Qwen2.5-0.5B-Instruct",
-        ...     args=config,
-        ...     train_dataset=dataset,
-        ...     prob_threshold=0.3,
-        ...     threshold_direction="higher",
-        ... )
-        >>> trainer.train()
+
+    prob_threshold (float or list[float]):
+        - "higher":  p(correct) < tau 인 토큰을 마스킹 (논문 기본)
+        - "lower":   p(correct) > tau 인 토큰을 마스킹
+        - "middle":  [low, high] 범위 밖 토큰 마스킹
+        - "random":  tau 확률로 랜덤 마스킹 (baseline)
+
+    threshold_direction: {"higher","lower","middle","random"}
+    use_profit_loss: ProFit 적용 여부
     """
-    
+
     def __init__(
         self,
         model: "str | PreTrainedModel",
@@ -81,22 +87,77 @@ class ProFitSFTTrainer(SFTTrainer):
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         peft_config: Optional[Any] = None,
         formatting_func: Callable[[dict], str] | None = None,
-        # ProFit 전용 파라미터
-        prob_threshold: Union[float, list[float]] = 0.3,
+        # ProFit params
+        prob_threshold: Union[float, list[float]] = 0.3,  # ✅ list 기본값(가변) 사용하지 않음
         threshold_direction: str = "higher",
         use_profit_loss: bool = True,
+        # logging
+        profit_log_every: int = 100,  # ✅ active ratio 로깅 주기(steps)
+        # 🆕 템플릿 토큰 강제 학습
+        force_include_tokens: Optional[list[str]] = None,  # 템플릿 토큰 텍스트 리스트 (일반 텍스트)
+        force_include_patterns: Optional[list[str]] = None,  # 🆕 정규식 패턴 리스트
+        use_pattern_masking: bool = False,  # 🆕 패턴을 정규식으로 처리할지 여부
     ):
-        """ProFit SFT Trainer 초기화."""
-        
-        # ProFit 파라미터 저장
         self.prob_threshold = prob_threshold if isinstance(prob_threshold, list) else [prob_threshold]
         self.threshold_direction = threshold_direction
         self.use_profit_loss = use_profit_loss
-        
-        # 파라미터 검증
+        self.profit_log_every = int(profit_log_every)
+        self.force_include_tokens = force_include_tokens or []
+        self.force_include_patterns = force_include_patterns or []
+        self.use_pattern_masking = use_pattern_masking
+
+        # 마지막 스텝 통계 저장용
+        self._last_profit_stats: dict[str, float] = {}
+
+        # 강제 포함 토큰 ID 저장 (tokenizer 초기화 후 설정)
+        self._force_include_token_ids: set[int] = set()
+
         self._validate_profit_params()
-        
-        # 부모 클래스 초기화 (compute_loss_func는 None으로 설정)
+
+        # 🆕 정규식 패턴 모드: super().__init__() 전에 데이터셋에 force_include_mask 추가
+        # processing_class를 tokenizer로 직접 사용
+        if (
+            self.use_pattern_masking
+            and self.force_include_patterns
+            and train_dataset is not None
+            and processing_class is not None
+        ):
+            from accelerate import PartialState
+
+            # main process에서만 출력
+            if PartialState().is_main_process:
+                print("\n" + "=" * 60)
+                print("정규식 패턴 기반 마스킹 적용 중...")
+                print("=" * 60)
+
+            train_dataset = self._add_pattern_masks_to_dataset(train_dataset, processing_class)
+            
+            # 🆕 Custom collator 자동 설정 (data_collator가 None일 때만)
+            if data_collator is None:
+                # padding_free 설정 확인
+                # TRL은 padding_free=True + custom collator 조합을 막아놨으므로
+                # args.padding_free를 False로 변경하고 collator에서 직접 처리
+                is_padding_free = getattr(args, "padding_free", False)
+                
+                if is_padding_free:
+                    from profit_data_collator import ProFitDataCollatorPaddingFree
+                    data_collator = ProFitDataCollatorPaddingFree(
+                        tokenizer=processing_class,
+                    )
+                    # TRL 제약 우회: padding_free=False로 변경
+                    args.padding_free = False
+                    if PartialState().is_main_process:
+                        print("✓ ProFitDataCollatorPaddingFree 설정됨")
+                        print("  (args.padding_free=False로 변경 - TRL 제약 우회)")
+                else:
+                    from profit_data_collator import ProFitDataCollatorForLanguageModeling
+                    data_collator = ProFitDataCollatorForLanguageModeling(
+                        tokenizer=processing_class,
+                        mlm=False,
+                    )
+                    if PartialState().is_main_process:
+                        print("✓ ProFitDataCollatorForLanguageModeling 설정됨 (padding 환경)")
+
         super().__init__(
             model=model,
             args=args,
@@ -104,7 +165,7 @@ class ProFitSFTTrainer(SFTTrainer):
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=processing_class,
-            compute_loss_func=None,  # compute_loss 메서드를 직접 오버라이드
+            compute_loss_func=None,  # compute_loss override
             compute_metrics=compute_metrics,
             callbacks=callbacks,
             optimizers=optimizers,
@@ -113,196 +174,325 @@ class ProFitSFTTrainer(SFTTrainer):
             peft_config=peft_config,
             formatting_func=formatting_func,
         )
-        
-        # ProFit 설정 로깅
+
+        # HF Trainer가 num_items_in_batch 등을 전달해도, 이 구현은 쓰지 않음.
+        self.model_accepts_loss_kwargs = True
+
+        # 🆕 tokenizer를 사용하여 강제 포함 토큰을 ID로 변환 (일반 텍스트 모드)
+        if self.force_include_tokens and self.tokenizer is not None and not self.use_pattern_masking:
+            for token_text in self.force_include_tokens:
+                # 각 토큰 텍스트를 인코딩하여 ID 추출
+                token_ids = self.tokenizer.encode(token_text, add_special_tokens=False)
+                self._force_include_token_ids.update(token_ids)
+
         if self.use_profit_loss and self.is_world_process_zero():
-            print("\n" + "="*60)
-            print("ProFit SFT Trainer 초기화 완료")
-            print("="*60)
-            print(f"Probability Threshold: {self.prob_threshold}")
-            print(f"Threshold Direction: {self.threshold_direction}")
-            print(f"마스킹 전략: ", end="")
-            if self.threshold_direction == "higher":
-                print(f"확률 < {self.prob_threshold[0]}인 토큰 마스킹 (낮은 확률 토큰 제거)")
-            elif self.threshold_direction == "lower":
-                print(f"확률 > {self.prob_threshold[0]}인 토큰 마스킹 (높은 확률 토큰 제거)")
-            elif self.threshold_direction == "middle":
-                print(f"확률 < {self.prob_threshold[0]} 또는 > {self.prob_threshold[1]}인 토큰 마스킹")
-            elif self.threshold_direction == "random":
-                print(f"{self.prob_threshold[0]*100:.1f}% 확률로 랜덤 마스킹")
-            print("="*60 + "\n")
-    
-    def _validate_profit_params(self):
-        """ProFit 파라미터 유효성 검사."""
-        valid_directions = ["higher", "lower", "middle", "random"]
-        if self.threshold_direction not in valid_directions:
-            raise ValueError(
-                f"threshold_direction은 {valid_directions} 중 하나여야 합니다. "
-                f"입력값: {self.threshold_direction}"
+            print("\n" + "=" * 60)
+            print("ProFitSFTTrainer (patched) initialized")
+            print("=" * 60)
+            print(f"prob_threshold={self.prob_threshold}")
+            print(f"threshold_direction={self.threshold_direction}")
+            print("loss = global_sum(nll_active_tokens) / global_sum(#active_tokens)")
+            print("stop-grad gate = detach(p_correct)")
+            print(f"profit_log_every={self.profit_log_every} steps")
+
+            if self.use_pattern_masking and self.force_include_patterns:
+                print(f"\n[정규식 패턴 모드]")
+                print(f"force_include_patterns={self.force_include_patterns}")
+                print("  → 정규식 패턴 매칭으로 토큰 강제 포함")
+            elif self.force_include_tokens:
+                print(f"\n[일반 텍스트 모드]")
+                print(f"force_include_tokens={self.force_include_tokens}")
+                print(f"force_include_token_ids={sorted(self._force_include_token_ids)}")
+
+            print("=" * 60 + "\n")
+
+    def _add_pattern_masks_to_dataset(
+        self,
+        dataset: Dataset | IterableDataset,
+        tokenizer: PreTrainedTokenizerBase,
+    ) -> Dataset | IterableDataset:
+        """
+        정규식 패턴을 사용하여 데이터셋에 force_include_mask를 추가합니다.
+
+        Args:
+            dataset: 원본 데이터셋
+            tokenizer: 토크나이저
+
+        Returns:
+            force_include_mask가 추가된 데이터셋
+        """
+        from utils.masking_utils import create_force_include_mask
+        from accelerate import PartialState
+
+        def add_mask(example):
+            """각 샘플에 force_include_mask 추가"""
+            # input_ids를 디코딩하여 원본 텍스트 복원
+            input_ids = example["input_ids"]
+            if isinstance(input_ids, list):
+                input_ids = torch.tensor(input_ids)
+
+            # 디코딩 (skip_special_tokens=False로 특수 토큰도 포함)
+            text = tokenizer.decode(input_ids, skip_special_tokens=False)
+
+            # 정규식 패턴 매칭으로 마스크 생성
+            force_mask = create_force_include_mask(
+                text=text,
+                tokenizer=tokenizer,
+                patterns=self.force_include_patterns,
+                add_special_tokens=False,
             )
-        
+
+            # 길이가 맞지 않으면 조정
+            if len(force_mask) < len(input_ids):
+                force_mask += [False] * (len(input_ids) - len(force_mask))
+            elif len(force_mask) > len(input_ids):
+                force_mask = force_mask[: len(input_ids)]
+
+            example["force_include_mask"] = force_mask
+            return example
+
+        # 데이터셋에 마스크 추가
+        if isinstance(dataset, Dataset):
+            dataset = dataset.map(add_mask, desc="Adding pattern masks")
+        else:
+            # IterableDataset은 map 지원 안 함 - 경고만 출력
+            if PartialState().is_main_process:
+                print("⚠️  경고: IterableDataset은 정규식 패턴 마스킹을 미리 적용할 수 없습니다.")
+                print("    → 학습 중 동적으로 처리되지만 성능이 저하될 수 있습니다.")
+
+        return dataset
+
+    def _validate_profit_params(self) -> None:
+        valid = {"higher", "lower", "middle", "random"}
+        if self.threshold_direction not in valid:
+            raise ValueError(f"threshold_direction must be one of {sorted(valid)}; got {self.threshold_direction}")
+
         if self.threshold_direction == "middle":
             if len(self.prob_threshold) != 2:
-                raise ValueError(
-                    "threshold_direction='middle'일 때 prob_threshold는 [lower, upper] 형태의 리스트여야 합니다."
-                )
+                raise ValueError("threshold_direction='middle' requires prob_threshold=[low, high]")
             if self.prob_threshold[0] >= self.prob_threshold[1]:
-                raise ValueError(
-                    f"middle 모드에서 lower < upper 조건을 만족해야 합니다. "
-                    f"현재값: {self.prob_threshold}"
-                )
-        
-        for threshold in self.prob_threshold:
-            if not 0.0 <= threshold <= 1.0:
-                raise ValueError(
-                    f"prob_threshold는 0.0과 1.0 사이의 값이어야 합니다. 현재값: {threshold}"
-                )
-    
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+                raise ValueError(f"middle mode requires low < high; got {self.prob_threshold}")
+
+        for t in self.prob_threshold:
+            if not (0.0 <= t <= 1.0):
+                raise ValueError(f"prob_threshold must be in [0,1]; got {t}")
+
+        if self.profit_log_every < 0:
+            raise ValueError(f"profit_log_every must be >= 0; got {self.profit_log_every}")
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
-        ProFit loss를 적용한 compute_loss 메서드.
-        
-        일반 SFT와 동일하게 forward pass를 수행하지만,
-        loss 계산 시 토큰의 확률에 따라 선택적으로 마스킹합니다.
+        ProFit loss를 적용한 compute_loss.
+        - forward로 logits 획득
+        - (shift) next-token prediction CE
+        - ProFit 마스킹 적용
+        - 전역 token-weighted 평균 loss 반환
         """
         if not self.use_profit_loss:
-            # ProFit을 사용하지 않을 경우 부모 클래스의 메서드 호출
-            return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
-        
-        # Labels 추출 (shift_labels가 있으면 우선 사용)
-        labels = inputs.get("labels")
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+        # ✅ inputs를 in-place 수정하지 않기
+        inputs = dict(inputs)
+
+        labels = inputs.get("labels", None)
         if labels is None:
-            raise ValueError("inputs에 'labels' 키가 없습니다.")
-        
-        # use_cache를 False로 설정 (gradient checkpointing과 호환)
+            raise ValueError("inputs must contain 'labels'")
+
+        # gradient checkpointing 호환
         inputs["use_cache"] = False
-        
-        # Forward pass
+
         outputs = model(**inputs)
-        logits = outputs.get("logits")
-        
+        logits = outputs.get("logits", None)
         if logits is None:
-            # logits가 없으면 모델이 이미 loss를 계산한 경우
-            loss = outputs.get("loss")
+            loss = outputs.get("loss", None)
             if loss is None:
-                raise ValueError("모델 출력에 'logits'와 'loss'가 모두 없습니다.")
+                raise ValueError("model outputs contain neither 'logits' nor 'loss'")
             return (loss, outputs) if return_outputs else loss
+
+        # 🆕 데이터셋에서 force_include_mask 가져오기 (정규식 패턴으로 생성된 경우)
+        force_include_mask = inputs.get("force_include_mask", None)
         
-        # ProFit loss 계산
-        loss = self._compute_profit_loss(logits, labels, num_items_in_batch)
+        # 🔍 디버그: force_include_mask 확인 (첫 100 스텝만)
+        if self.use_pattern_masking and self.is_world_process_zero():
+            step = getattr(self.state, "global_step", 0) or 0
+            if step < 100 and step % 20 == 0:  # 처음 100 스텝 중 20마다
+                if force_include_mask is not None:
+                    mask_count = force_include_mask.sum().item()
+                    total_count = force_include_mask.numel()
+                    print(f"[DEBUG step={step}] force_include_mask: {mask_count}/{total_count} tokens protected")
+                else:
+                    print(f"[DEBUG step={step}] ⚠️  force_include_mask is None!")
         
+        loss = self._profit_loss_from_logits(
+            logits=logits, 
+            labels=labels,
+            force_include_mask=force_include_mask,
+        )
+
+        # ✅ 주기적 로깅: active ratio / counts
+        if self.profit_log_every > 0 and self.is_world_process_zero():
+            step = getattr(self.state, "global_step", 0) or 0
+            if step > 0 and (step % self.profit_log_every == 0) and self._last_profit_stats:
+                active = self._last_profit_stats.get("active_tokens", float("nan"))
+                valid = self._last_profit_stats.get("valid_tokens", float("nan"))
+                ratio = self._last_profit_stats.get("active_ratio", float("nan"))
+                thr = self._last_profit_stats.get("threshold", float("nan"))
+                forced = self._last_profit_stats.get("forced_tokens", 0.0)
+                msg = (
+                    f"[ProFit] step={step} threshold={thr:.4f} "
+                    f"active={active:.0f} valid={valid:.0f} active_ratio={ratio:.4f}"
+                )
+                if forced > 0:
+                    msg += f" forced={forced:.0f}"
+                print(msg)
+
         return (loss, outputs) if return_outputs else loss
-    
-    def _compute_profit_loss(
+
+    def _profit_loss_from_logits(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        num_items_in_batch: Optional[int] = None,
+        force_include_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        ProFit Cross Entropy Loss 계산.
-        
-        Args:
-            logits: 모델 출력 logits [batch_size, seq_len, vocab_size]
-            labels: 타겟 labels [batch_size, seq_len]
-            num_items_in_batch: 전체 배치 크기 (gradient accumulation 고려)
-        
-        Returns:
-            loss: 계산된 loss 값
+        logits: [B, T, V]
+        labels: [B, T]
+        force_include_mask: [B, T] (optional) - 정규식 패턴으로 생성된 마스크
+        표준 causal LM CE 정렬: logits[:, :-1] vs labels[:, 1:]
         """
         logits = logits.float()
-        vocab_size = logits.size(-1)
-        
-        # Labels shift (다음 토큰 예측)
-        # [batch, seq_len] -> [batch, seq_len+1] (padding) -> [batch, seq_len] (shift)
-        labels = F.pad(labels, (0, 1), value=-100)
-        shift_labels = labels[..., 1:].contiguous()
-        
-        # Flatten
-        logits = logits.view(-1, vocab_size)
-        shift_labels = shift_labels.view(-1)
-        shift_labels = shift_labels.to(logits.device)
-        
-        # ProFit Cross Entropy
-        loss = self._profit_cross_entropy(
-            logits,
-            shift_labels,
-            num_items_in_batch,
-            self.prob_threshold,
-            self.threshold_direction,
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = labels[:, 1:].contiguous()
+
+        # force_include_mask도 shift
+        shift_force_mask = None
+        if force_include_mask is not None:
+            shift_force_mask = force_include_mask[:, 1:].contiguous()
+
+        _, _, V = shift_logits.shape
+        flat_logits = shift_logits.view(-1, V)
+        flat_labels = shift_labels.view(-1).to(flat_logits.device)
+        flat_force_mask = shift_force_mask.view(-1) if shift_force_mask is not None else None
+
+        return self._profit_cross_entropy_token_weighted(
+            logits_2d=flat_logits,
+            labels_1d=flat_labels,
+            prob_threshold=self.prob_threshold,
+            threshold_direction=self.threshold_direction,
+            ignore_index=-100,
+            force_include_mask_1d=flat_force_mask,
         )
-        
-        return loss
-    
-    def _profit_cross_entropy(
+
+    def _profit_cross_entropy_token_weighted(
         self,
-        source: torch.Tensor,
-        target: torch.Tensor,
-        num_items_in_batch: Optional[int] = None,
-        prob_threshold: list[float] = [0.3],
-        threshold_direction: str = "higher",
+        logits_2d: torch.Tensor,  # [N, V]
+        labels_1d: torch.Tensor,  # [N]
+        prob_threshold: list[float],
+        threshold_direction: str,
         ignore_index: int = -100,
+        force_include_mask_1d: Optional[torch.Tensor] = None,  # 🆕 정규식 패턴으로 생성된 마스크
     ) -> torch.Tensor:
         """
-        확률 기반 선택적 마스킹을 적용한 Cross Entropy Loss.
-        
-        Args:
-            source: logits [N, vocab_size]
-            target: labels [N]
-            num_items_in_batch: 전체 배치 아이템 수 (사용 안 함, 호환성 유지용)
-            prob_threshold: 확률 임계값
-            threshold_direction: 마스킹 방향
-            ignore_index: 무시할 인덱스 값
-        
-        Returns:
-            loss: 계산된 loss 값
+        1) log_softmax로 logp 계산
+        2) 정답 토큰 logp만 gather
+        3) p_correct = exp(logp_correct)
+        4) detach(p_correct)로 마스킹 조건 산출
+        5) active token들의 NLL을 sum
+        6) (분산이면) loss_sum과 active_count를 all-reduce(sum)
+        7) global_loss = global_loss_sum / global_active_count
+        + (4) 로깅용 통계 저장
+        + 🆕 강제 포함 토큰은 확률과 관계없이 항상 학습
+        + 🆕 정규식 패턴으로 생성된 마스크 지원
         """
-        # 1. 확률 계산
-        probs = F.softmax(source, dim=-1)
-        
-        # 2. 정답 토큰의 확률 추출
-        target_for_gather = target.clone().clamp(min=0)  # -100을 0으로 변환 (gather용)
-        prob_of_correct_token = probs.gather(
-            dim=-1, index=target_for_gather.unsqueeze(-1)
-        ).squeeze(-1)
-        
-        # 3. 새로운 타겟 생성 (마스킹 적용)
-        new_target = target.clone()
-        
-        # 4. Threshold에 따라 마스킹 조건 설정
+        # valid target mask (label != ignore_index)
+        valid = labels_1d.ne(ignore_index)
+
+        # gather를 위해 -100은 0으로 치환 (valid=False인 위치는 어차피 제외됨)
+        gather_idx = labels_1d.clone()
+        gather_idx[~valid] = 0
+        gather_idx = gather_idx.clamp(min=0)
+
+        # log probs
+        log_probs = F.log_softmax(logits_2d, dim=-1)  # [N, V]
+        logp_correct = log_probs.gather(dim=-1, index=gather_idx.unsqueeze(-1)).squeeze(-1)  # [N]
+        p_correct = logp_correct.exp()  # [N] in (0,1]
+
+        # stop-grad gate
+        p_det = p_correct.detach()
+
+        # masking condition
         if threshold_direction == "higher":
-            # 낮은 확률 토큰 마스킹 (ProFit 기본 설정)
-            mask_condition = (prob_of_correct_token.detach() < prob_threshold[0])
+            threshold = float(prob_threshold[0])
+            mask = p_det.lt(threshold)
         elif threshold_direction == "lower":
-            # 높은 확률 토큰 마스킹
-            mask_condition = (prob_of_correct_token.detach() > prob_threshold[0])
+            threshold = float(prob_threshold[0])
+            mask = p_det.gt(threshold)
         elif threshold_direction == "middle":
-            # 중간 범위 밖 토큰 마스킹
-            mask_condition = (
-                (prob_of_correct_token.detach() < prob_threshold[0]) |
-                (prob_of_correct_token.detach() > prob_threshold[1])
-            )
+            low, high = prob_threshold
+            threshold = float(low)  # 로깅용(대표값)
+            mask = p_det.lt(low) | p_det.gt(high)
         elif threshold_direction == "random":
-            # 랜덤 마스킹 (baseline)
-            mask_condition = torch.rand_like(prob_of_correct_token) < prob_threshold[0]
+            threshold = float(prob_threshold[0])
+            # (가독성 개선) valid인 위치에서만 random mask를 의미있게 적용
+            mask = valid & torch.rand_like(p_det).lt(threshold)
         else:
-            raise ValueError(f"알 수 없는 threshold_direction: {threshold_direction}")
-        
-        # 5. 마스킹 적용
-        new_target[mask_condition] = ignore_index
-        
-        # 6. 유효한 토큰 개수 계산 (원래 마스킹 + ProFit 마스킹 모두 고려)
-        # transformers의 LabelSmoother와 동일한 방식
-        num_active_elements = (new_target != ignore_index).sum()
-        
-        # 7. Loss 계산 (reduction="sum"으로 먼저 합산)
-        loss = F.cross_entropy(
-            source, new_target, ignore_index=ignore_index, reduction="sum"
-        )
-        
-        # 8. 토큰 단위 평균 계산 (유효한 토큰 개수로 나누기)
-        loss = loss / torch.clamp(num_active_elements, min=1)
-        
+            raise ValueError(f"Unknown threshold_direction: {threshold_direction}")
+
+        # 🆕 강제 포함 토큰 마스크 생성 (토큰 ID 기반 + 정규식 패턴 기반)
+        force_include_mask = torch.zeros_like(valid, dtype=torch.bool)
+
+        # 1) 토큰 ID 기반 (기존 방식)
+        if len(self._force_include_token_ids) > 0:
+            for token_id in self._force_include_token_ids:
+                force_include_mask |= labels_1d == token_id
+
+        # 2) 정규식 패턴 기반 (새로운 방식)
+        if force_include_mask_1d is not None:
+            force_include_mask |= force_include_mask_1d.to(force_include_mask.device)
+
+        # 최종 active = valid & ((~mask) | force_include)
+        # 즉, 확률 기반 마스킹을 통과하거나 강제 포함 토큰이면 학습
+        active = valid & ((~mask) | force_include_mask)
+
+        # nll = -logp_correct (active만)
+        nll = -logp_correct
+        nll_sum = nll.masked_select(active).sum()  # scalar
+        active_count = active.sum().to(dtype=nll_sum.dtype)  # scalar (float)
+        valid_count = valid.sum().to(dtype=nll_sum.dtype)  # scalar (float)
+
+        # 🆕 강제 포함된 토큰 수 계산
+        forced_count = (valid & force_include_mask).sum().to(dtype=nll_sum.dtype)
+
+        # 분산이면 전역 sum
+        nll_sum_global = _all_reduce_sum_(nll_sum)
+        active_count_global = _all_reduce_sum_(active_count)
+        valid_count_global = _all_reduce_sum_(valid_count)
+        forced_count_global = _all_reduce_sum_(forced_count)
+
+        # divide (clamp to avoid zero)
+        denom = torch.clamp(active_count_global, min=1.0)
+        loss = nll_sum_global / denom
+
+        # DeepSpeed 호환: 0-dim scalar 보장 (이미 scalar지만 명시적으로 처리)
+        # multi-GPU에서 all_reduce 후에도 scalar shape 유지를 확실히 함
+        # if loss.ndim != 0:
+        # loss = loss.squeeze()
+
+        # ✅ 로깅용 통계 저장(프로세스 0에서만 사용)
+        # 값은 모든 rank에서 같아야 하므로 global 값을 씀
+        with torch.no_grad():
+            active_g = float(active_count_global.item())
+            valid_g = float(valid_count_global.item())
+            forced_g = float(forced_count_global.item())
+            ratio_g = (active_g / valid_g) if valid_g > 0 else 0.0
+            self._last_profit_stats = {
+                "active_tokens": active_g,
+                "valid_tokens": valid_g,
+                "active_ratio": ratio_g,
+                "threshold": float(threshold),
+                "forced_tokens": forced_g,
+            }
+
         return loss
 
 
@@ -317,39 +507,11 @@ def create_profit_trainer(
     num_train_epochs: int = 3,
     per_device_train_batch_size: int = 4,
     gradient_accumulation_steps: int = 4,
+    force_include_tokens: Optional[list[str]] = None,
+    force_include_patterns: Optional[list[str]] = None,
+    use_pattern_masking: bool = False,
     **kwargs,
 ) -> ProFitSFTTrainer:
-    """
-    ProFit Trainer를 쉽게 생성하는 헬퍼 함수.
-    
-    Args:
-        model: 모델 이름 또는 PreTrainedModel
-        train_dataset: 학습 데이터셋
-        eval_dataset: 평가 데이터셋 (optional)
-        output_dir: 출력 디렉토리
-        prob_threshold: ProFit 확률 임계값
-        threshold_direction: 마스킹 방향
-        learning_rate: 학습률
-        num_train_epochs: 에폭 수
-        per_device_train_batch_size: 디바이스당 배치 크기
-        gradient_accumulation_steps: gradient accumulation 스텝
-        **kwargs: 추가 SFTConfig 파라미터
-    
-    Returns:
-        ProFitSFTTrainer 인스턴스
-    
-    Examples:
-        >>> from datasets import load_dataset
-        >>> dataset = load_dataset("roneneldan/TinyStories", split="train[:1%]")
-        >>> 
-        >>> trainer = create_profit_trainer(
-        ...     model="Qwen/Qwen2.5-0.5B-Instruct",
-        ...     train_dataset=dataset,
-        ...     prob_threshold=0.3,
-        ...     threshold_direction="higher",
-        ... )
-        >>> trainer.train()
-    """
     config = SFTConfig(
         output_dir=output_dir,
         learning_rate=learning_rate,
@@ -361,42 +523,20 @@ def create_profit_trainer(
         report_to="none",
         **kwargs,
     )
-    
-    trainer = ProFitSFTTrainer(
+
+    return ProFitSFTTrainer(
         model=model,
         args=config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         prob_threshold=prob_threshold,
         threshold_direction=threshold_direction,
+        use_profit_loss=True,
+        force_include_tokens=force_include_tokens,
+        force_include_patterns=force_include_patterns,
+        use_pattern_masking=use_pattern_masking,
     )
-    
-    return trainer
 
 
 if __name__ == "__main__":
-    # 간단한 사용 예제
-    print("ProFit SFT Trainer 모듈")
-    print("="*60)
-    print("사용 예제:")
-    print("""
-from profit_sft_trainer import ProFitSFTTrainer, create_profit_trainer
-from datasets import load_dataset
-
-# 방법 1: 직접 생성
-trainer = ProFitSFTTrainer(
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    train_dataset=dataset,
-    prob_threshold=0.3,
-    threshold_direction="higher",
-)
-
-# 방법 2: 헬퍼 함수 사용
-trainer = create_profit_trainer(
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    train_dataset=dataset,
-    prob_threshold=0.3,
-)
-
-trainer.train()
-    """)
+    print("ProFit SFT Trainer (patched)")
