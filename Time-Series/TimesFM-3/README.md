@@ -93,7 +93,7 @@ TiRex의 [Contiguous Patch Masking(CPM)](https://github.com/YooSungHyun/paper-re
 
 ![5](./img/5.png)
 
-모델 사이즈대비 그냥 어마어마한 SOTA달성!
+모델 사이즈대비 그저 GOAT
 
 ## 마치며
 
